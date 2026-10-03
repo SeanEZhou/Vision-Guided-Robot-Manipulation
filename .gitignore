@@ -1,0 +1,33 @@
+# Python environment and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Private planning notes
+Robotics_Perception_Project_Guide.md
+
+# Personal Claude Code settings (shared .claude/settings.json is fine to commit)
+.claude/settings.local.json
+
+# Secrets and local config
+.env
+.env.*
+
+# Generated simulation outputs: regenerate with the scripts.
+# Force-add curated demo assets with `git add -f results/<file>`.
+results/
+MUJOCO_LOG.TXT
+*.npy
+*.npz
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
