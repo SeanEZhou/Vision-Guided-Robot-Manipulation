@@ -14,8 +14,8 @@ Built on [MuJoCo](https://mujoco.org/) physics and [robosuite](https://robosuite
 |---|---|
 | 1. Scripted pick-and-place from known object and bin poses | **Done** |
 | 2. Localize the object from RGB-D images; report position error against ground truth | **Done** |
-| 3. Vision-driven pick-and-place | Next |
-| 4. Timestamps, stale-target rejection, timeouts, single retry | Planned |
+| 3. Vision-driven pick-and-place | **Done** |
+| 4. Timestamps, stale-target rejection, timeouts, single retry | Next |
 | 5. Held-out evaluation across ground-truth, vision, and vision + recovery configurations | Planned |
 
 Results and a demo video will be added as each milestone is evaluated. No performance numbers are reported until they have been measured.
@@ -66,6 +66,43 @@ All 100 estimates were valid. Latency covers segmentation through the position e
 - *Pixel indices as coordinates.* Treating integer pixel indices as continuous coordinates shifts every point by half a pixel, which caused a constant 1.8 mm error. Back-projection now uses pixel centers.
 - *Plain averaging of lid-height points.* In 12 of the 100 held-out placements, the source bin's front wall hides the can's base from the camera. Along that boundary, 13–21 pixels blend can and wall colors and pass the red threshold, but their depth comes from the wall's top edge, which is at the same height as the lid. These points sit 7–8 cm from the can yet pass the lid height test. Averaging them in raises the held-out xy error from 1.9 to 4.3 mm at p95 and from 2.1 to 6.4 mm at worst. Dropping points more than one can radius from the median removes them.
 
+### Milestone 3: vision-driven pick-and-place
+
+The camera's estimate from milestone 2 replaces the known position from milestone 1. Each trial places the can at a random pose in the source bin, takes one RGB-D frame with the arm in its start pose, estimates the can's position, and runs the scripted pick-and-place ([policy.py](policy.py)) to that target. The policy advances phases using only its own end-effector feedback. The evaluator ([scripts/pick_place_eval.py](scripts/pick_place_eval.py)) reads the can's true pose only to score and classify outcomes.
+
+<p>
+  <img src="docs/images/pick_place_vision.png" width="49%" alt="Agentview camera frame before the grasp, with the segmented can highlighted and a zoomed inset showing the estimated and true can centres">
+  <img src="docs/images/pick_place_grasp.png" width="49%" alt="The same camera view moments later, with the gripper holding the can above the source bin">
+</p>
+
+*One held-out trial, seen from the perception camera. Left: the single frame the decision is based on, with the arm in its start pose. The segmented can is green, and the inset shows the estimated centre the arm is sent to (yellow ×), 1.2 mm from the true centre (blue +). Right: the arm has closed on the can at that target and lifted it on its way to the target bin.*
+
+A trial succeeds when robosuite's task check holds, the gripper is open, and the can moves less than 5 mm over 0.5 s of simulation, all within a 30 s simulation budget.
+
+Each configuration runs on the same 100 held-out placements (seed 1000), and the evaluator asserts that every configuration saw identical scenes. The *truth* configuration uses the simulator's true position as the grasp target, which isolates motion and grasp failures from perception failures.
+
+| Configuration | Success | 95% CI (Wilson) | Sim time per episode (median) |
+|---|---|---|---|
+| Truth target | 100 / 100 | 96.3–100% | 10.5 s |
+| Vision target | 100 / 100 | 96.3–100% | 10.5 s |
+
+Vision matches the truth reference on every placement. robosuite's own task check agreed with the stricter success rule on all 200 trials. Perception adds 2.9 ms median and 3.6 ms p95 per decision. An episode takes 1.45 s of wall time (median), about 7× faster than real time on this machine. That figure excludes rendering for review videos.
+
+**How much error the grasp tolerates.** With no failures to analyze, a sweep replaces perception with a controlled error: the true position shifted a fixed distance in a per-trial random horizontal direction, on the same 100 placements.
+
+| Grasp target error | Success | 95% CI | Failures |
+|---|---|---|---|
+| 5, 10, 15 mm | 100 / 100 each | 96–100% | none |
+| 20 mm | 82 / 100 | 73–88% | 14 missed grasps, 4 dropped in transit |
+| 25 mm | 27 / 100 | 19–36% | 59 missed grasps, 13 dropped, 1 misplaced |
+| 30 mm | 2 / 100 | 1–7% | 91 missed grasps, 6 dropped, 1 misplaced |
+
+The grasp tolerates at least 15 mm of error and breaks down between 15 and 25 mm. The vision estimate's worst held-out error is 2.1 mm, about 7× inside the last error that never failed.
+
+Failure rates do not depend much on the error's direction relative to the fingers. At 20 mm, errors mostly along the finger-closing axis succeed 40/51 times, and errors mostly across it succeed 42/49 times. The two directions fail differently. In reviewed examples, an error across the closing axis leaves the fingers closing on the can's edge without a hold. An error along it brings a finger down on the lid and knocks the can over.
+
+**Limits of this result.** The scenes are clean: one upright can, no clutter, no sensor noise, and a can that stays still between the camera frame and the grasp. The policy is open-loop after perception, so it does not check whether the grasp held. Milestone 4 adds that feedback, along with stale-target checks and a single retry.
+
 ## System design
 
 The target architecture keeps perception, geometry, and task logic as separate components with small interfaces. In the final vision configuration, the policy cannot access simulator object poses or segmentation IDs; only the evaluator uses ground truth.
@@ -104,6 +141,16 @@ python scripts/localize_eval.py --trials 100 --seed 1000   # writes results/step
 
 Outputs: `trials.csv` (per-trial estimate, truth, error and latency), `summary.json`, and zoomed overlays of the best, median and worst trials in `overlays/`. In the overlays, the mask is green, the true position is a blue cross, and the estimate is a yellow ×.
 
+Pick-and-place evaluation and grasp-error sweep:
+
+```bash
+python scripts/pick_place_eval.py --trials 100 --seed 1000                      # truth vs vision
+python scripts/pick_place_eval.py --trials 100 --seed 1000 \
+    --configs offset5 offset10 offset15 offset20 offset25 offset30 --out results/step3_sweep
+```
+
+Outputs: `trials.csv` (per-trial outcome, failure category, target error, timings) and `summary.json` (success rates with confidence intervals, outcome counts, latency and episode-time statistics). For the vision configuration only, `cases/` holds a video and perception overlay for 3 successful trials, chosen to show the can at well-separated positions in the bin, plus up to 3 failures if any occur. Trials run without rendering. Saved cases are then replayed with video from a fresh environment, and the script asserts that each replay reproduces the original outcome and final can position.
+
 ## Engineering notes
 
 - **MuJoCo version pin.** robosuite 1.5.2 fails on startup with MuJoCo 3.14 because newer MuJoCo returns joint types that no longer compare equal to robosuite's enum check. `requirements-lock.txt` pins MuJoCo 3.3.7.
@@ -119,13 +166,14 @@ Outputs: `trials.csv` (per-trial estimate, truth, error and latency), `summary.j
 ```
 geometry.py                      Camera model: depth conversion, projection, back-projection
 perception.py                    Can localization from one RGB-D frame (no simulator state)
+policy.py                        Scripted pick-and-place phases on the OSC_POSE controller
 scripts/pick_place_scripted.py   Milestone 1: scripted pick-and-place with known poses
 scripts/localize_eval.py         Milestone 2: localization error against ground truth
+scripts/pick_place_eval.py       Milestone 3: truth vs vision pick-and-place, grasp-error sweep
+docs/images/                     Figures used in this README
 requirements-lock.txt            Exact package versions
 results/                         Generated outputs (not committed)
 ```
-
-`sim_adapter.py`, `policy.py`, and `evaluate.py` will be split out when perception and motion are connected.
 
 ## Evaluation plan
 
