@@ -2,7 +2,7 @@
 
 A simulated robot arm that uses an RGB-D camera to locate an object, pick it up, and place it in a bin. The project then measures how perception errors and processing delays affect task success, and adds recovery behavior for missed grasps and stale targets.
 
-Built on [MuJoCo](https://mujoco.org/) physics and [robosuite](https://robosuite.ai/) task assets. The setup uses a Franka Panda arm with a parallel-jaw gripper, one fixed RGB-D camera, and one rigid object (robosuite's `PickPlaceCan` task).
+Built on [MuJoCo](https://mujoco.org/) physics and [robosuite](https://robosuite.ai/) task assets. The setup uses a Franka Panda arm with a parallel-jaw gripper, one fixed RGB-D camera, and one rigid object per scene. Milestones 1–3 use a soda can (robosuite's `PickPlaceCan` task). Milestone 4 extends this to four object types, each with its own target compartment.
 
 ![Simulation setup: Panda arm approaching a red can in the source bin, with the four-compartment target bin to its right](docs/images/setup.png)
 
@@ -15,8 +15,9 @@ Built on [MuJoCo](https://mujoco.org/) physics and [robosuite](https://robosuite
 | 1. Scripted pick-and-place from known object and bin poses | **Done** |
 | 2. Localize the object from RGB-D images; report position error against ground truth | **Done** |
 | 3. Vision-driven pick-and-place | **Done** |
-| 4. Timestamps, stale-target rejection, timeouts, single retry | Next |
-| 5. Held-out evaluation across ground-truth, vision, and vision + recovery configurations | Planned |
+| 4. Multiple object types: estimate identity, position and orientation; orientation-aware grasp | **Done** |
+| 5. Timestamps, stale-target rejection, grasp check, timeouts, single retry | Next |
+| 6. Held-out evaluation across ground-truth, vision, and vision + recovery configurations | Planned |
 
 Results and a demo video will be added as each milestone is evaluated. No performance numbers are reported until they have been measured.
 
@@ -101,7 +102,66 @@ The grasp tolerates at least 15 mm of error and breaks down between 15 and 25 mm
 
 Failure rates do not depend much on the error's direction relative to the fingers. At 20 mm, errors mostly along the finger-closing axis succeed 40/51 times, and errors mostly across it succeed 42/49 times. The two directions fail differently. In reviewed examples, an error across the closing axis leaves the fingers closing on the can's edge without a hold. An error along it brings a finger down on the lid and knocks the can over.
 
-**Limits of this result.** The scenes are clean: one upright can, no clutter, no sensor noise, and a can that stays still between the camera frame and the grasp. The policy is open-loop after perception, so it does not check whether the grasp held. Milestone 4 adds that feedback, along with stale-target checks and a single retry.
+**Limits of this result.** The scenes are clean: one upright can, no clutter, no sensor noise, and a can that stays still between the camera frame and the grasp. The policy is open-loop after perception, so it does not check whether the grasp held. Milestone 5 adds that feedback, along with stale-target checks and a single retry.
+
+### Milestone 4: multiple objects and orientation
+
+A can looks the same from every angle, so milestones 1–3 never had to estimate orientation. Milestone 4 places one of four robosuite objects per scene, at a random position and a random rotation about the vertical axis. Each object goes to its own compartment of the target bin.
+
+| Object | Footprint × height | What it adds | Grasp rotation |
+|---|---|---|---|
+| Can | 50 mm round × 80 mm | Baseline from milestones 1–3 | Start pose (round) |
+| Milk carton | 40 × 40 mm × 144 mm | Tall and light; gable roof; nearly white on a light wooden bin | Across a pair of faces |
+| Bread | 40 × 48 mm × 48 mm | Short, so the hand drops below the bin rim | Any; chosen to clear the bin walls |
+| Cereal box | 30 × 100 mm × 150 mm | Fits the 80 mm gripper only across its thin side | Across the 30 mm side |
+
+<img src="docs/images/multi_object_perception.png" width="70%" alt="Four zoomed camera views, one per object, showing the depth segmentation, top-surface points, estimated centre, finger-closing direction, and the identified object with its measured height and footprint">
+
+*One held-out scene per object, as the perception camera sees it. Green: the object found by depth segmentation. Magenta: its top surface, used for the pose. Yellow ×: estimated centre. Blue line: the direction the fingers will close. For the cereal box that is across its thin side; for the milk carton, along its roof ridge, i.e. across two faces. The text gives the identification and the height and footprint it was based on.*
+
+Perception ([object_perception.py](object_perception.py)) replaces milestone 2's color threshold with geometry, so it works for any packaging. It follows the industry pattern of segment → identify → fit, with every stage geometric:
+
+1. **Segment by depth.** Every pixel is back-projected; the object is the largest region of points inside the source bin's walls and above its floor. Bin positions are known scene layout, not object state.
+2. **Identify by measured shape.** Height separates bread (48 mm), can (80 mm), and the two tall objects. The footprint separates those: about 100 mm long for cereal vs 40 mm for milk. A measured height that does not match the identified object makes the estimate invalid.
+3. **Fit the pose from the top surface.** Centre = centroid of the top-surface points after median-based outlier rejection. The cereal box's rotation comes from a minimum-area rectangle fit to its top face. The milk carton's comes from the principal direction of its roof ridge, which runs parallel to two faces.
+
+The grasp ([policy.py](policy.py)) turns the gripper about the vertical axis to the object's closing direction, grasps 2.5 cm below the object's top, and sets carry and release heights from the object's size.
+
+**Results on held-out placements** (50 per object, seeds 3000–3003; development used seeds 0–3 and 2000–2003). Both configurations run on identical placements, checked by the evaluator.
+
+| Object | Truth target | Vision target | Identified correctly |
+|---|---|---|---|
+| Milk carton | 50 / 50 | 50 / 50 | 50 / 50 |
+| Bread | 50 / 50 | 50 / 50 | 50 / 50 |
+| Cereal box | 50 / 50 | 50 / 50 | 50 / 50 |
+| Can | 50 / 50 | 50 / 50 | 50 / 50 |
+| **All** | **200 / 200** (95% CI 98.1–100%) | **200 / 200** (98.1–100%) | **200 / 200** |
+
+| Vision error (all objects) | Median | p95 | Max |
+|---|---|---|---|
+| Horizontal centre | 1.7 mm | 3.1 mm | 3.5 mm |
+| Top height | 0.5 mm | 0.8 mm | 2.6 mm |
+| Cereal box rotation | 0.01° | 0.02° | 0.11° |
+| Milk carton rotation (modulo 90°) | 0.2° | 0.7° | 1.3° |
+| Perception latency | 12.7 ms | 21 ms | 42 ms |
+
+Episodes take 9.8 s of simulated time (median), and no phase timed out. Latency is higher than milestone 2's 2.7 ms because every pixel of the 640×480 frame is back-projected before segmentation. That is still well within the 100 ms target; cropping to the bin's image region would reduce it.
+
+**How much rotation error the cereal-box grasp tolerates.** The true target with the finger direction rotated by a fixed angle, on the same 50 placements:
+
+| Rotation error | 10° | 20° | 30° | 45° | 60° | 75° | No alignment (start pose) |
+|---|---|---|---|---|---|---|---|
+| Success | 50 / 50 | 50 / 50 | 50 / 50 | 50 / 50 | 0 / 50 | 0 / 50 | 33 / 50 |
+
+The grasp tolerates at least 45° and fails completely by 60°, all as missed grasps. Contact-level checks show the box does not twist into alignment as the fingers close: at 45° it is lifted still 45° off. The finger pads are narrow, so what matters is the box's width along the strip each finger sweeps on the way down, not its full outline. Up to 45°, the box's corners pass beside the pads. At 60°, a corner lies under a descending finger, which lands on the box and knocks it over. Vision's worst cereal-box rotation error, 0.11°, is about 400× inside the tolerated range. Without any rotation estimate, the grasp succeeds only when the random rotation happens to fall in that range (33/50), so estimating rotation is necessary.
+
+**Problems found while building this.** Each was diagnosed from contact or joint data before being fixed.
+
+- *The hand hit the bin walls when grasping bread.* The Panda hand is 20.4 cm long along the finger-closing axis. Bread is short enough that the hand drops below the bin rim and its ends hit a wall within about 10 cm, which caused stalled descents and one dropped loaf in development. The grasp planner now tries every rotation the object allows and keeps the one with the most wall clearance.
+- *The wrist joint hit its limit for some cereal-box rotations.* A parallel gripper grasps identically at yaws 180° apart. Choosing within ±90° sent wrist joint 7 to its +166° limit when the needed yaw was near −80°, stalling the transfer in 6 of 50 placements. Choosing the equivalent yaw in [−45°, 135°) keeps the joint well clear.
+- *A strictly vertical gripper could not reach the can's compartment*, the farthest corner of the target bin. Round objects keep milestone 3's start orientation, whose slight tilt gives the arm the extra reach.
+
+**Limits.** One object per scene, always upright, no clutter, no sensor noise. Identification relies on four objects with distinct shapes. A larger catalog, or objects with similar shapes, would need appearance-based recognition such as a learned classifier, which is the natural next comparison. The policy is still open-loop after perception; milestone 5 adds grasp checks and retry.
 
 ## System design
 
@@ -151,6 +211,16 @@ python scripts/pick_place_eval.py --trials 100 --seed 1000 \
 
 Outputs: `trials.csv` (per-trial outcome, failure category, target error, timings) and `summary.json` (success rates with confidence intervals, outcome counts, latency and episode-time statistics). For the vision configuration only, `cases/` holds a video and perception overlay for 3 successful trials, chosen to show the can at well-separated positions in the bin, plus up to 3 failures if any occur. Trials run without rendering. Saved cases are then replayed with video from a fresh environment, and the script asserts that each replay reproduces the original outcome and final can position.
 
+Multi-object evaluation and rotation sweep:
+
+```bash
+python scripts/multi_object_eval.py --trials 50 --seed 3000                      # truth vs vision, 4 objects
+python scripts/multi_object_eval.py --trials 50 --seed 3000 --objects cereal --no-videos \
+    --configs yaw10 yaw20 yaw30 yaw45 yaw60 yaw75 noalign --out results/step4_yaw_sweep
+```
+
+Outputs as above, plus per-object identification accuracy and rotation error in `summary.json`. `cases/` holds one vision success video per object, plus vision failures if any occur.
+
 ## Engineering notes
 
 - **MuJoCo version pin.** robosuite 1.5.2 fails on startup with MuJoCo 3.14 because newer MuJoCo returns joint types that no longer compare equal to robosuite's enum check. `requirements-lock.txt` pins MuJoCo 3.3.7.
@@ -159,17 +229,20 @@ Outputs: `trials.csv` (per-trial outcome, failure category, target error, timing
 - **Depth units.** robosuite returns MuJoCo's normalized `[0, 1]` depth buffer, not metres. `geometry.py` converts it to optical-axis depth using the near and far clip planes.
 - **Camera frame.** MuJoCo cameras look down their −z axis with y up. `geometry.py` flips y and z to get OpenCV axes, which match the vertically flipped images. Each evaluation run checks that projection followed by back-projection recovers 100 random points to within 1e-9 m.
 - **Renderer resets.** robosuite's default `hard_reset=True` rebuilds the renderer on every reset, which crashed with heap corruption on the WSL GLFW path. The evaluation uses `hard_reset=False`.
-- **Grasp height.** The fingertips extend about 2 cm below the controller's grip site. A grasp target at the can's center drove the fingers into the bin floor, so the grasp point is set slightly above center.
+- **Grasp height.** The finger pads span 5.5 mm below to 12.8 mm above the controller's grip site, and the hand's underside is 28.5 mm above it. A grip site deeper than about 2.5 cm below an object's top lands the palm on the object. With the can, a target at its center stalled 21 mm short, with contact between the hand and the can's top. The grasp point is therefore 2.5 cm below the object's top (1.5 cm above the can's center). An earlier version of this note blamed the fingers hitting the bin floor; contact logging showed the palm was the cause.
+- **Hand clearance in the bin.** The Panda hand is 20.4 cm long along the finger-closing axis. Grasping a short object (the 48 mm bread) puts the hand below the bin rim, where its ends hit the walls when the object is within about 10 cm of one. The grasp planner tries every rotation the object allows and picks the one that keeps the hand farthest from the walls.
 
 ## Repository layout
 
 ```
 geometry.py                      Camera model: depth conversion, projection, back-projection
 perception.py                    Can localization from one RGB-D frame (no simulator state)
-policy.py                        Scripted pick-and-place phases on the OSC_POSE controller
+object_perception.py             Multi-object identification and pose from depth (no simulator state)
+policy.py                        Scripted pick-and-place phases, grasp rotation and wall clearance
 scripts/pick_place_scripted.py   Milestone 1: scripted pick-and-place with known poses
 scripts/localize_eval.py         Milestone 2: localization error against ground truth
 scripts/pick_place_eval.py       Milestone 3: truth vs vision pick-and-place, grasp-error sweep
+scripts/multi_object_eval.py     Milestone 4: four objects, truth vs vision, rotation-error sweep
 docs/images/                     Figures used in this README
 requirements-lock.txt            Exact package versions
 results/                         Generated outputs (not committed)
