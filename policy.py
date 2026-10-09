@@ -103,27 +103,35 @@ def choose_closing_dir(center_xy, grip_z, candidates):
     return max(candidates, key=lambda c: hand_clearance(center_xy, c))
 
 
-def make_object_phases(grasp_xy, top_z, height, closing_candidates, place_xy):
+def make_object_phases(grasp_xy, top_z, height, closing_candidates, place_xy, hold_rot=None, clear_z=BIN_RIM_Z):
     """Waypoints for one object. Each phase: (name, target, gripper, hold, timeout, orientation).
     closing_candidates (from grasp_candidates) lists the allowed finger-closing directions; None (a
     round object) keeps the gripper's start orientation, as in milestones 1-3: there is no side to align
     with, and the start pose's slight tilt lets the arm reach the target bin's far compartment, which a
-    strictly vertical gripper cannot."""
+    strictly vertical gripper cannot. With several picks per scene, pass that start orientation as
+    hold_rot: it is held while grasping (otherwise the gripper would keep whatever orientation the previous
+    pick left it in), then released after the lift so the arm can tilt as needed to reach the far
+    compartment. clear_z is the highest obstacle the carried object must pass over: the bin rims, or
+    in a cluttered bin the tallest remaining object."""
     grasp = np.array([grasp_xy[0], grasp_xy[1], top_z - GRASP_BELOW_TOP])
-    rot = None if closing_candidates is None else \
+    rot = hold_rot if closing_candidates is None else \
         gripper_down(choose_closing_dir(grasp_xy, grasp[2], closing_candidates))[0]
     hang = grasp[2] - (top_z - height)  # how far the held object's bottom hangs below the grip site
-    carry_z = max(BIN_RIM_Z + CARRY_CLEARANCE + hang, MIN_CARRY_Z)
-    release = np.array([place_xy[0], place_xy[1], BIN_FLOOR_Z + RELEASE_CLEARANCE + hang])
+    carry_z = max(max(clear_z, BIN_RIM_Z) + CARRY_CLEARANCE + hang, MIN_CARRY_Z)
+    # Release low enough for a short drop, but never with the hand below the target bin's rim, where it
+    # can hit the compartment walls (a short object would otherwise be lowered that far).
+    release_z = max(BIN_FLOOR_Z + RELEASE_CLEARANCE + hang, BIN_RIM_Z - HAND_BOTTOM_ABOVE_GRIP + 0.005)
+    release = np.array([place_xy[0], place_xy[1], release_z])
+    carry_rot = None if closing_candidates is None else rot
     return [
         ("approach", grasp + [0, 0, HOVER_DZ], OPEN, 0, 150, rot),
         ("descend", grasp, OPEN, 0, 120, rot),
         ("close", grasp, CLOSE, 15, 30, rot),
         ("lift", np.array([grasp[0], grasp[1], carry_z]), CLOSE, 0, 150, rot),
-        ("transfer", np.array([release[0], release[1], carry_z]), CLOSE, 0, 200, rot),
-        ("lower", release, CLOSE, 0, 120, rot),
-        ("release", release, OPEN, 15, 30, rot),
-        ("retreat", np.array([release[0], release[1], carry_z]), OPEN, 0, 100, rot),
+        ("transfer", np.array([release[0], release[1], carry_z]), CLOSE, 0, 200, carry_rot),
+        ("lower", release, CLOSE, 0, 120, carry_rot),
+        ("release", release, OPEN, 15, 30, carry_rot),
+        ("retreat", np.array([release[0], release[1], carry_z]), OPEN, 0, 100, carry_rot),
     ]
 
 

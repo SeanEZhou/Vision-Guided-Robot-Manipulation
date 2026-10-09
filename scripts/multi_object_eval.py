@@ -58,11 +58,12 @@ def make_env(obj, seed):
     )
 
 
-def object_truth(env):
-    """True geometry of the active object from its collision mesh (evaluator only): centre, top and
-    bottom height, footprint (short, long), the horizontal direction of its short side, and tilt."""
+def object_truth(env, name=None):
+    """True geometry of an object (default: the active one) from its collision mesh (evaluator only):
+    centre, top and bottom height, footprint (short, long), the horizontal direction of its short side,
+    and tilt."""
     m, d = env.sim.model, env.sim.data
-    body = env.obj_body_id[env.objects[env.object_id].name]
+    body = env.obj_body_id[name or env.objects[env.object_id].name]
     signs = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
     corners, axes = [], []
     for g in range(m.ngeom):

@@ -67,45 +67,40 @@ def classify(height, long_side):
     return "cereal" if long_side > 0.07 else "milk"
 
 
-def estimate_object(rgb, depth_normalized, camera):
-    """rgb (H, W, 3) and depth (H, W[, 1]) in image orientation; camera is a geometry.CameraModel.
-    rgb is unused: segmentation and identification are geometric (kept for interface parity)."""
-    t0 = time.perf_counter()
-    est = ObjectEstimate()
-
-    def done(reason, valid=False):
-        est.reason, est.valid, est.latency_s = reason, valid, time.perf_counter() - t0
-        return est
-
+def backproject_frame(depth_normalized, camera):
+    """World point for every pixel, shape (H, W, 3)."""
     H, W = camera.height, camera.width
     v, u = np.mgrid[0:H, 0:W]
     Z = camera.metric_depth(depth_normalized)
-    pts = camera.backproject(np.stack([u.ravel(), v.ravel()], axis=1) + 0.5, Z.ravel()).reshape(H, W, 3)
-    x, y, z = pts[..., 0], pts[..., 1], pts[..., 2]
-    mask = ((x > BIN_X[0]) & (x < BIN_X[1]) & (y > BIN_Y[0]) & (y < BIN_Y[1])
-            & (z > BIN_FLOOR_Z + MIN_ABOVE_FLOOR) & (z < BIN_FLOOR_Z + MAX_ABOVE_FLOOR))
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-    if n <= 1:
-        return done("nothing above the bin floor")
-    mask = labels == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    est.mask = mask
-    P = pts[mask]
-    if len(P) < MIN_POINTS:
-        return done(f"object region too small ({len(P)} px)")
+    return camera.backproject(np.stack([u.ravel(), v.ravel()], axis=1) + 0.5, Z.ravel()).reshape(H, W, 3)
 
+
+def above_bin_floor(pts):
+    """Pixels whose points lie inside the source bin's walls and above its floor."""
+    x, y, z = pts[..., 0], pts[..., 1], pts[..., 2]
+    return ((x > BIN_X[0]) & (x < BIN_X[1]) & (y > BIN_Y[0]) & (y < BIN_Y[1])
+            & (z > BIN_FLOOR_Z + MIN_ABOVE_FLOOR) & (z < BIN_FLOOR_Z + MAX_ABOVE_FLOOR))
+
+
+def fit_region(est, P, label=None):
+    """Identify (unless `label` is given) and fit the grasp pose of one object from its points P (N, 3).
+    Fills `est`; returns the failure reason, or None if the estimate is valid."""
+    est.label = label  # the network's label, if given, even when the fit below fails
+    if len(P) < MIN_POINTS:
+        return f"object region too small ({len(P)} px)"
     z_top = np.percentile(P[:, 2], 99)
     (_, _), (w, h), _ = cv2.minAreaRect((P[:, :2] * 1000).astype(np.float32))
     est.measured_height = z_top - BIN_FLOOR_Z
     est.measured_footprint = (min(w, h) / 1000, max(w, h) / 1000)
-    label = classify(est.measured_height, est.measured_footprint[1])
+    label = label or classify(est.measured_height, est.measured_footprint[1])
     spec = OBJECTS[label]
     est.label, est.top_z, est.height = label, z_top, spec["height"]
     if abs(est.measured_height - spec["height"]) > HEIGHT_TOL:
-        return done(f"height {est.measured_height * 1000:.0f} mm does not match {label}")
+        return f"height {est.measured_height * 1000:.0f} mm does not match {label}"
 
     top = P[P[:, 2] > z_top - TOP_MARGIN]
     if len(top) < MIN_TOP_POINTS:
-        return done(f"too few top points ({len(top)})")
+        return f"too few top points ({len(top)})"
     radius = 0.5 * np.hypot(*spec["footprint"]) + 0.004
     median = np.median(top[:, :2], axis=0)
     top = top[np.linalg.norm(top[:, :2] - median, axis=1) < radius]
@@ -119,4 +114,50 @@ def estimate_object(rgb, depth_normalized, camera):
     elif spec["align"] == "faces":
         centred = top[:, :2] - top[:, :2].mean(axis=0)
         est.closing_dir = np.linalg.svd(centred, full_matrices=False)[2][0]  # principal (ridge) direction
-    return done("ok", valid=True)
+    return None
+
+
+def estimate_object(rgb, depth_normalized, camera):
+    """Milestone 4: the one object in the bin. rgb (H, W, 3) and depth (H, W[, 1]) in image orientation;
+    camera is a geometry.CameraModel. rgb is unused: segmentation and identification are geometric."""
+    t0 = time.perf_counter()
+    est = ObjectEstimate()
+
+    def done(reason, valid=False):
+        est.reason, est.valid, est.latency_s = reason, valid, time.perf_counter() - t0
+        return est
+
+    pts = backproject_frame(depth_normalized, camera)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(above_bin_floor(pts).astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return done("nothing above the bin floor")
+    est.mask = labels == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    reason = fit_region(est, pts[est.mask])
+    return done(reason or "ok", valid=reason is None)
+
+
+def estimate_objects(rgb, depth_normalized, camera, masks=None, mask_labels=None):
+    """Milestone 5: every object in the bin. Without `masks`, segmentation is geometric: each connected
+    region of points above the bin floor is taken to be one object, so touching objects merge into one
+    region. With `masks` (boolean (H, W) arrays, e.g. from a learned instance segmenter) and optional
+    `mask_labels`, each mask's pixels are used instead, still intersected with the above-floor region
+    so that mask pixels on the bin floor or walls do not enter the fit."""
+    t0 = time.perf_counter()
+    pts = backproject_frame(depth_normalized, camera)
+    above = above_bin_floor(pts)
+    if masks is None:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(above.astype(np.uint8), connectivity=8)
+        masks = [labels == i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= MIN_POINTS]
+        mask_labels = [None] * len(masks)
+    elif mask_labels is None:
+        mask_labels = [None] * len(masks)
+    estimates = []
+    for mask, label in zip(masks, mask_labels):
+        est = ObjectEstimate(mask=mask)
+        reason = fit_region(est, pts[mask & above], label)
+        est.reason, est.valid = reason or "ok", reason is None
+        estimates.append(est)
+    latency = time.perf_counter() - t0
+    for est in estimates:
+        est.latency_s = latency
+    return estimates

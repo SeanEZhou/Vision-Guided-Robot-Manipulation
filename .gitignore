@@ -20,6 +20,8 @@ Robotics_Perception_Project_Guide.md
 # Generated simulation outputs: regenerate with the scripts.
 # Force-add curated demo assets with `git add -f results/<file>`.
 results/
+data/
+models/
 MUJOCO_LOG.TXT
 *.npy
 *.npz
